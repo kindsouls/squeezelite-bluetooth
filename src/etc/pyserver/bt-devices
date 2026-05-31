@@ -1,2 +1,23 @@
-00:00:00:00:00:00=Livingroom
-AA:BB:CC:DD:EE:FF=Bathroom
+# bt-devices — Bluetooth speaker configuration
+# One [MAC] section per speaker. Add entries with: sudo ./install.sh --add-device
+#
+# Required:
+#   name    Player name shown in LMS — no spaces (use underscores or CamelCase)
+#
+# Optional:
+#   codec   Audio codec: sbc (default), aptx, aac, sbc-xq, faststream
+#           Only applies if both the Pi and speaker support the codec.
+#   lms     LMS server IP or hostname (default: auto-discover via mDNS on LAN)
+#           Set this if auto-discovery fails (e.g. on segmented networks).
+#
+# Changes here take effect on the next speaker connect — no service restart needed.
+#
+# Examples:
+#
+# [AA:BB:CC:DD:EE:FF]
+# name = Livingroom
+#
+# [11:22:33:44:55:66]
+# name = Bathroom
+# codec = aptx
+# lms = 192.168.1.10

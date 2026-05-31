@@ -5,7 +5,15 @@ After=bluetooth.service
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/bluealsa -p a2dp-source
+ExecStart=/usr/bin/bluealsa --profile=a2dp-source
+Restart=on-failure
+RestartSec=5
+
+# Sandboxing — conservative because bluealsa runs as root and needs
+# direct Bluetooth hardware access via AF_BLUETOOTH kernel sockets.
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes
 
 [Install]
 WantedBy=multi-user.target

@@ -1,6 +1,7 @@
 [Unit]
-Description=Bluetooth Speaker Connectionmonitor
-After=syslog.target
+Description=Bluetooth Speaker Connection Monitor
+Requires=bluezalsa.service
+After=syslog.target bluetooth.service bluezalsa.service
 
 [Service]
 Type=simple
@@ -9,10 +10,20 @@ Environment=LIBASOUND_THREAD_SAFE=0
 WorkingDirectory=/etc/pyserver
 ExecStart=/etc/pyserver/btspeaker-monitor.py
 SyslogIdentifier=btspeaker-monitor
-StandardOutput=syslog
-StandardError=syslog
+StandardOutput=journal
+StandardError=journal
 Restart=always
 RestartSec=3
+
+# Sandboxing — lms user is unprivileged so tighter restrictions are safe.
+# ReadWritePaths allows config migration to write bt-devices in-place.
+# RestrictAddressFamilies is intentionally omitted: the squeezelite
+# subprocess inherits this namespace and needs AF_INET to reach LMS.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/etc/pyserver
+ProtectHome=yes
+PrivateTmp=yes
 
 [Install]
 WantedBy=multi-user.target
