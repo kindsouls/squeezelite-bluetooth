@@ -16,13 +16,22 @@ import dbus.mainloop.glib
 
 CONFIG_FILE    = '/etc/pyserver/bt-devices'
 SQUEEZE_LITE   = '/usr/bin/squeezelite'
+
+# bluez-alsa D-Bus constants
 BLUEALSA_BUS   = 'org.bluealsa'
 BLUEALSA_PATH  = '/org/bluealsa'
 BLUEALSA_IFACE = 'org.bluealsa.Manager1'
 
+# BlueZ D-Bus constants (used in PipeWire mode)
+BLUEZ_BUS          = 'org.bluez'
+BLUEZ_DEVICE_IFACE = 'org.bluez.Device1'
+
 HEALTH_CHECK_INTERVAL_S = 10   # seconds between dead-process sweeps
-STARTUP_QUERY_DELAY_S   = 2    # wait after bluealsa appears before querying PCMs
+STARTUP_QUERY_DELAY_S   = 2    # wait for audio stack to settle after a connect event
 RESTART_DELAY_S         = 3    # delay before restarting a crashed squeezelite
+
+# Written by install.sh to /etc/pyserver/audio-backend; defaults to bluealsa
+AUDIO_BACKEND = os.environ.get('AUDIO_BACKEND', 'bluealsa').lower()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,7 +51,7 @@ bus = None
 class DeviceConfig:
     mac:   str
     name:  str
-    codec: Optional[str] = None   # e.g. 'aptx', 'aac', 'sbc-xq'
+    codec: Optional[str] = None   # bluealsa only; ignored in PipeWire mode
     lms:   Optional[str] = None   # LMS server IP/hostname; None = auto-discover
 
 
@@ -69,11 +78,11 @@ def _is_old_format(path):
                 if not line or line.startswith('#'):
                     continue
                 if line.startswith('['):
-                    return False   # INI section found — already new format
+                    return False   # INI section — already new format
                 if '=' in line:
                     key = line.split('=', 1)[0].strip().upper()
                     if _valid_mac(key):
-                        return True   # MAC=Name line found — old format
+                        return True   # bare MAC=Name line — old format
     except OSError:
         pass
     return False
@@ -171,28 +180,36 @@ def get_device_config(dev):
 
 
 # ---------------------------------------------------------------------------
-# Player lifecycle
+# Player lifecycle — shared by both backends
 # ---------------------------------------------------------------------------
+
+def _build_squeezelite_cmd(hci, device_config):
+    """Build the squeezelite command for the active audio backend."""
+    if AUDIO_BACKEND == 'pipewire':
+        # PipeWire handles codec negotiation internally; the codec option is unused.
+        cmd = [SQUEEZE_LITE, '-o', 'pipewire',
+               '-n', device_config.name, '-m', device_config.mac, '-f', '/dev/null']
+    else:
+        alsa_parts = [f'HCI={hci}', f'DEV={device_config.mac}', 'PROFILE=a2dp-source']
+        if device_config.codec:
+            alsa_parts.append(f'CODEC={device_config.codec}')
+        cmd = [SQUEEZE_LITE, '-o', 'bluealsa:' + ','.join(alsa_parts),
+               '-n', device_config.name, '-m', device_config.mac, '-f', '/dev/null']
+    if device_config.lms:
+        cmd += ['-s', device_config.lms]
+    return cmd
+
 
 def start_squeezelite(hci, device_config, _attempt=0):
     key = device_config.mac.replace(':', '_')
     if key in players:
         return False   # already running
 
-    alsa_parts = [f'HCI={hci}', f'DEV={device_config.mac}', 'PROFILE=a2dp-source']
-    if device_config.codec:
-        alsa_parts.append(f'CODEC={device_config.codec}')
-    alsa_dev = 'bluealsa:' + ','.join(alsa_parts)
-
-    cmd = [SQUEEZE_LITE, '-o', alsa_dev, '-n', device_config.name,
-           '-m', device_config.mac, '-f', '/dev/null']
-    if device_config.lms:
-        cmd += ['-s', device_config.lms]
-
+    cmd = _build_squeezelite_cmd(hci, device_config)
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         players[key] = Player(proc=proc, hci=hci, config=device_config)
-        log.info("Started squeezelite for %s (%s) via %s", device_config.name, device_config.mac, hci)
+        log.info("Started squeezelite for %s (%s)", device_config.name, device_config.mac)
     except OSError as e:
         if _attempt < 3:
             delay = 2 ** _attempt   # 1 s, 2 s, 4 s
@@ -229,7 +246,7 @@ def stop_all_players():
 
 
 # ---------------------------------------------------------------------------
-# Health check — sweeps for crashed squeezelite and restarts automatically
+# Health check — shared; auto-restarts crashed squeezelite on either backend
 # ---------------------------------------------------------------------------
 
 def check_player_health():
@@ -240,17 +257,16 @@ def check_player_health():
                 player.config.name, player.proc.returncode, RESTART_DELAY_S,
             )
             players.pop(key, None)
-            # Re-read config in case it was edited since last start
             fresh_config = get_device_config(player.config.mac) or player.config
             GLib.timeout_add_seconds(
                 RESTART_DELAY_S,
                 lambda h=player.hci, c=fresh_config: start_squeezelite(h, c),
             )
-    return True   # keep the GLib timeout repeating
+    return True   # keep repeating
 
 
 # ---------------------------------------------------------------------------
-# D-Bus: bluealsa PCM signals
+# bluez-alsa backend — PCM signal handlers
 # ---------------------------------------------------------------------------
 
 def _parse_pcm_path(path):
@@ -268,22 +284,18 @@ def bluealsa_handler(path, *args, **kwargs):
     hci, dev = _parse_pcm_path(path)
     if not hci or not dev:
         return
-    device_config = get_device_config(dev)
-    if device_config is None:
+    cfg = get_device_config(dev)
+    if cfg is None:
         log.debug("Ignoring unknown device: %s", dev)
         return
     if member == 'PCMAdded':
-        start_squeezelite(hci, device_config)
+        start_squeezelite(hci, cfg)
     elif member == 'PCMRemoved':
-        stop_squeezelite(dev, device_config.name)
+        stop_squeezelite(dev, cfg.name)
 
-
-# ---------------------------------------------------------------------------
-# Startup query — pick up speakers already connected before we started
-# ---------------------------------------------------------------------------
 
 def query_existing_pcms():
-    """Ask bluealsa for its current PCM list; safe to call when not yet up."""
+    """bluez-alsa: pick up speakers already active before we started."""
     try:
         mgr_obj = bus.get_object(BLUEALSA_BUS, BLUEALSA_PATH)
         mgr     = dbus.Interface(mgr_obj, BLUEALSA_IFACE)
@@ -294,23 +306,96 @@ def query_existing_pcms():
             log.info("Picked up %d existing PCM(s) from bluealsa", len(pcms))
     except dbus.exceptions.DBusException as e:
         log.debug("Startup PCM query skipped (bluealsa not ready): %s", e)
-    return False   # GLib: don't repeat
+    return False
 
 
 # ---------------------------------------------------------------------------
-# D-Bus: watch for bluealsa service appearing / disappearing
+# PipeWire backend — BlueZ property change handlers
+# ---------------------------------------------------------------------------
+
+def on_bluez_properties_changed(iface, changed, invalidated, path=None, **kwargs):
+    """PipeWire: fires when any BlueZ object property changes."""
+    if iface != BLUEZ_DEVICE_IFACE:
+        return
+    # Guard against PipeWire's own PropertiesChanged signals on non-BlueZ paths
+    if not str(path).startswith('/org/bluez/'):
+        return
+    if 'Connected' not in changed:
+        return
+
+    connected = bool(changed['Connected'])
+    parts = str(path).split('/')
+    if len(parts) < 5:
+        return
+    hci = parts[3]
+    dev = ':'.join(parts[4].split('_')[1:]).upper()
+
+    cfg = get_device_config(dev)
+    if cfg is None:
+        log.debug("Ignoring unknown device: %s", dev)
+        return
+
+    log.info("BlueZ: %s %s (%s)", cfg.name, "connected" if connected else "disconnected", dev)
+    if connected:
+        # Brief delay: PipeWire needs time to finish A2DP codec negotiation
+        GLib.timeout_add_seconds(
+            STARTUP_QUERY_DELAY_S,
+            lambda h=hci, c=cfg: start_squeezelite(h, c)
+        )
+    else:
+        stop_squeezelite(dev, cfg.name)
+
+
+def query_connected_bluez_devices():
+    """PipeWire: pick up speakers already connected before we started."""
+    try:
+        obj = bus.get_object(BLUEZ_BUS, '/')
+        mgr = dbus.Interface(obj, 'org.freedesktop.DBus.ObjectManager')
+        for path, ifaces in mgr.GetManagedObjects().items():
+            if BLUEZ_DEVICE_IFACE not in ifaces:
+                continue
+            props = ifaces[BLUEZ_DEVICE_IFACE]
+            if not props.get('Connected', False):
+                continue
+            mac = str(props.get('Address', '')).upper()
+            cfg = get_device_config(mac)
+            if cfg is None:
+                continue
+            parts = str(path).split('/')
+            hci = parts[3] if len(parts) >= 4 else 'hci0'
+            log.info("PipeWire startup: found connected device %s (%s)", cfg.name, mac)
+            GLib.timeout_add_seconds(
+                STARTUP_QUERY_DELAY_S,
+                lambda h=hci, c=cfg: start_squeezelite(h, c)
+            )
+    except dbus.exceptions.DBusException as e:
+        log.debug("BlueZ startup query failed: %s", e)
+    return False
+
+
+# ---------------------------------------------------------------------------
+# D-Bus: watch for the relevant audio service appearing / disappearing
 # ---------------------------------------------------------------------------
 
 def on_name_owner_changed(name, old_owner, new_owner):
-    if name != BLUEALSA_BUS:
-        return
-    if new_owner:
-        log.info("bluealsa service appeared — querying for active PCMs in %ds",
-                 STARTUP_QUERY_DELAY_S)
-        GLib.timeout_add_seconds(STARTUP_QUERY_DELAY_S, query_existing_pcms)
+    if AUDIO_BACKEND == 'pipewire':
+        if name != BLUEZ_BUS:
+            return
+        if new_owner:
+            log.info("BlueZ appeared — querying connected devices in %ds", STARTUP_QUERY_DELAY_S)
+            GLib.timeout_add_seconds(STARTUP_QUERY_DELAY_S, query_connected_bluez_devices)
+        else:
+            log.warning("BlueZ disappeared — stopping all players")
+            stop_all_players()
     else:
-        log.warning("bluealsa service disappeared — stopping all players")
-        stop_all_players()
+        if name != BLUEALSA_BUS:
+            return
+        if new_owner:
+            log.info("bluealsa appeared — querying PCMs in %ds", STARTUP_QUERY_DELAY_S)
+            GLib.timeout_add_seconds(STARTUP_QUERY_DELAY_S, query_existing_pcms)
+        else:
+            log.warning("bluealsa disappeared — stopping all players")
+            stop_all_players()
 
 
 # ---------------------------------------------------------------------------
@@ -335,6 +420,10 @@ def preflight_check():
     if not os.path.isfile(CONFIG_FILE):
         log.error("Device config not found at %s — create it first", CONFIG_FILE)
         ok = False
+    if AUDIO_BACKEND == 'pipewire':
+        log.info("Audio backend: PipeWire (ensure squeezelite was built with PipeWire support)")
+    else:
+        log.info("Audio backend: bluez-alsa")
     return ok
 
 
@@ -352,19 +441,30 @@ if __name__ == '__main__':
     dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
     bus = dbus.SystemBus()
 
-    bus.add_signal_receiver(
-        bluealsa_handler,
-        dbus_interface=BLUEALSA_IFACE,
-        interface_keyword='dbus_interface',
-        member_keyword='member',
-    )
-
+    # Always watch for the relevant audio service restarting
     bus.add_signal_receiver(
         on_name_owner_changed,
         dbus_interface='org.freedesktop.DBus',
         signal_name='NameOwnerChanged',
         path='/org/freedesktop/DBus',
     )
+
+    if AUDIO_BACKEND == 'pipewire':
+        bus.add_signal_receiver(
+            on_bluez_properties_changed,
+            dbus_interface='org.freedesktop.DBus.Properties',
+            signal_name='PropertiesChanged',
+            path_keyword='path',
+        )
+        GLib.idle_add(query_connected_bluez_devices)
+    else:
+        bus.add_signal_receiver(
+            bluealsa_handler,
+            dbus_interface=BLUEALSA_IFACE,
+            interface_keyword='dbus_interface',
+            member_keyword='member',
+        )
+        GLib.idle_add(query_existing_pcms)
 
     devices = load_devices()
     if devices:
@@ -373,7 +473,6 @@ if __name__ == '__main__':
     else:
         log.warning("No devices in %s — add entries and restart this service", CONFIG_FILE)
 
-    GLib.idle_add(query_existing_pcms)
     GLib.timeout_add_seconds(HEALTH_CHECK_INTERVAL_S, check_player_health)
 
     GLib.MainLoop().run()

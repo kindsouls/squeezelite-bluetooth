@@ -1,12 +1,16 @@
 [Unit]
 Description=Bluetooth Speaker Connection Monitor
-Requires=bluezalsa.service
+# Wants= (not Requires=) so this service still starts on PipeWire systems
+# where bluezalsa.service is not installed.
+Wants=bluezalsa.service
 After=syslog.target bluetooth.service bluezalsa.service
 
 [Service]
 Type=simple
 User=lms
 Environment=LIBASOUND_THREAD_SAFE=0
+# Audio backend written by install.sh; defaults to bluealsa if file absent.
+EnvironmentFile=-/etc/pyserver/audio-backend
 WorkingDirectory=/etc/pyserver
 ExecStart=/etc/pyserver/btspeaker-monitor.py
 SyslogIdentifier=btspeaker-monitor

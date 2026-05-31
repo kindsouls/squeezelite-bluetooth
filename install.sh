@@ -6,7 +6,7 @@
 #   sudo ./install.sh --update     # redeploy files and restart services
 #   sudo ./install.sh --add-device # pair a new Bluetooth speaker
 #        ./install.sh --status     # show current system state (no sudo needed)
-#   sudo ./install.sh --uninstall  # remove everything
+#   sudo ./install.sh --uninstall  # remove everything (delegates to uninstall.sh)
 
 set -euo pipefail
 
@@ -17,7 +17,15 @@ PYSERVER_DIR=/etc/pyserver
 SERVICE_DIR=/etc/systemd/system
 LMS_USER=lms
 BLUEALSA_SRC="$HOME/bluez-alsa"
+MANIFEST_DIR=/var/lib/squeezelite-bluetooth
+MANIFEST="$MANIFEST_DIR/install.manifest"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Set by detect_audio_backend(); override with FORCE_AUDIO_BACKEND=pipewire|bluealsa
+AUDIO_BACKEND=""
+
+# Guard: manifest_add() only writes during main() to avoid polluting on --update
+WRITING_MANIFEST=false
 
 # ---------------------------------------------------------------------------
 # Colours
@@ -34,6 +42,11 @@ ok()    { echo -e "  ${GREEN}✓${NC} $*"; }
 warn()  { echo -e "  ${YELLOW}⚠${NC}  $*"; }
 err()   { echo -e "  ${RED}✗${NC}  $*" >&2; }
 die()   { err "$*"; exit 1; }
+
+manifest_add() {
+    $WRITING_MANIFEST || return 0
+    echo "$1" >> "$MANIFEST"
+}
 
 # ---------------------------------------------------------------------------
 # Guards
@@ -107,12 +120,20 @@ build_bluealsa_from_source() {
     make -j"$(nproc)"
     make install
     ok "bluez-alsa installed to /usr/bin/bluealsa"
+    manifest_add "BLUEALSA=source:${BLUEALSA_SRC}"
 }
 
 install_bluealsa() {
+    if [[ "$AUDIO_BACKEND" == pipewire ]]; then
+        step "Skipping bluealsa (PipeWire backend in use)"
+        manifest_add "BLUEALSA=skipped-pipewire"
+        return 0
+    fi
+
     step "Checking for bluealsa"
     if command -v bluealsa &>/dev/null; then
         ok "bluealsa already installed at $(command -v bluealsa) — skipping build"
+        manifest_add "BLUEALSA=preexisting"
         return 0
     fi
 
@@ -121,10 +142,57 @@ install_bluealsa() {
         step "Installing bluealsa via apt"
         apt-get install -y bluealsa
         ok "bluealsa installed via apt"
+        manifest_add "BLUEALSA=apt"
         return 0
     fi
 
     build_bluealsa_from_source
+}
+
+# ---------------------------------------------------------------------------
+# Audio backend detection
+# ---------------------------------------------------------------------------
+detect_audio_backend() {
+    step "Detecting audio backend"
+
+    # Allow explicit override via environment variable
+    if [[ -n "${FORCE_AUDIO_BACKEND:-}" ]]; then
+        AUDIO_BACKEND="$FORCE_AUDIO_BACKEND"
+        ok "Audio backend forced to: $AUDIO_BACKEND"
+        manifest_add "AUDIO_BACKEND=$AUDIO_BACKEND"
+        return 0
+    fi
+
+    local is_pw=false
+
+    # WirePlumber running — manages BT audio routing under PipeWire
+    pgrep -x wireplumber &>/dev/null && is_pw=true || true
+
+    # System-level PipeWire service
+    systemctl is-active --quiet pipewire.service 2>/dev/null && is_pw=true || true
+
+    # PipeWire socket for the default Pi user (uid 1000)
+    [[ -S "/run/user/1000/pipewire-0" ]] && is_pw=true || true
+
+    if $is_pw; then
+        AUDIO_BACKEND=pipewire
+        ok "PipeWire detected — using PipeWire audio backend"
+        warn "bluez-alsa will not be installed (not needed with PipeWire)"
+        warn "squeezelite must support -o pipewire; Bookworm's packaged version does"
+        warn "To override: FORCE_AUDIO_BACKEND=bluealsa sudo ./install.sh"
+    else
+        AUDIO_BACKEND=bluealsa
+        ok "PipeWire not detected — using bluez-alsa audio backend"
+        warn "To override: FORCE_AUDIO_BACKEND=pipewire sudo ./install.sh"
+    fi
+
+    manifest_add "AUDIO_BACKEND=$AUDIO_BACKEND"
+}
+
+write_backend_config() {
+    printf 'AUDIO_BACKEND=%s\n' "$AUDIO_BACKEND" > "$PYSERVER_DIR/audio-backend"
+    manifest_add "FILE=$PYSERVER_DIR/audio-backend"
+    ok "Wrote audio-backend config: $AUDIO_BACKEND"
 }
 
 # ---------------------------------------------------------------------------
@@ -133,7 +201,6 @@ install_bluealsa() {
 warn_if_old_format() {
     local cfg="$PYSERVER_DIR/bt-devices"
     [[ -f "$cfg" ]] || return 0
-    # Old format has bare MAC=Name lines with no [section] headers
     if grep -qE '^[A-Fa-f0-9]{2}(:[A-Fa-f0-9]{2}){5}=' "$cfg" 2>/dev/null; then
         warn "bt-devices is in the old MAC=Name format"
         warn "The monitor will auto-migrate it to INI format on next start"
@@ -147,13 +214,16 @@ warn_if_old_format() {
 deploy_files() {
     step "Deploying files"
     mkdir -p "$PYSERVER_DIR"
+    manifest_add "OWNED_DIR=$PYSERVER_DIR"
 
     cp "$SCRIPT_DIR/src/etc/pyserver/btspeaker-monitor.py" "$PYSERVER_DIR/"
+    manifest_add "FILE=$PYSERVER_DIR/btspeaker-monitor.py"
     ok "btspeaker-monitor.py"
 
     # Never overwrite an existing bt-devices that may contain real entries
     if [[ ! -f "$PYSERVER_DIR/bt-devices" ]]; then
         cp "$SCRIPT_DIR/src/etc/pyserver/bt-devices" "$PYSERVER_DIR/"
+        manifest_add "FILE=$PYSERVER_DIR/bt-devices"
         ok "bt-devices (new)"
     else
         ok "bt-devices (kept existing)"
@@ -161,6 +231,8 @@ deploy_files() {
 
     cp "$SCRIPT_DIR/src/etc/systemd/system/bluezalsa.service"         "$SERVICE_DIR/"
     cp "$SCRIPT_DIR/src/etc/systemd/system/btspeaker-monitor.service" "$SERVICE_DIR/"
+    manifest_add "FILE=$SERVICE_DIR/bluezalsa.service"
+    manifest_add "FILE=$SERVICE_DIR/btspeaker-monitor.service"
     ok "systemd service files"
 }
 
@@ -173,6 +245,7 @@ create_lms_user() {
         ok "User '$LMS_USER' already exists"
     else
         adduser --disabled-login --no-create-home --system "$LMS_USER"
+        manifest_add "USER=$LMS_USER"
         ok "User '$LMS_USER' created"
     fi
 
@@ -210,6 +283,7 @@ configure_bt_autopoweron() {
     else
         printf '\n[Policy]\nAutoEnable=true\n' >> "$conf"
     fi
+    manifest_add "BT_AUTOPOWER=$conf"
     ok "AutoEnable=true added to $conf"
 }
 
@@ -220,11 +294,18 @@ enable_services() {
     step "Enabling and starting services"
     systemctl daemon-reload
 
-    for svc in bluezalsa btspeaker-monitor; do
-        systemctl enable  "${svc}.service"
-        systemctl restart "${svc}.service"
-        ok "${svc}.service enabled and started"
-    done
+    # bluezalsa is only needed on the bluez-alsa backend
+    if [[ "$AUDIO_BACKEND" == bluealsa ]]; then
+        systemctl enable  bluezalsa.service
+        systemctl restart bluezalsa.service
+        manifest_add "SERVICE=bluezalsa"
+        ok "bluezalsa.service enabled and started"
+    fi
+
+    systemctl enable  btspeaker-monitor.service
+    systemctl restart btspeaker-monitor.service
+    manifest_add "SERVICE=btspeaker-monitor"
+    ok "btspeaker-monitor.service enabled and started"
 }
 
 verify_install() {
@@ -250,8 +331,8 @@ verify_install() {
         echo "  Check system state at any time:"
         echo "    $0 --status"
         echo
-        echo "  Watch live logs:"
-        echo "    sudo journalctl -fu btspeaker-monitor"
+        echo "  To remove everything later:"
+        echo "    sudo ./uninstall.sh"
     else
         echo
         warn "One or more services failed to start. Check the logs above."
@@ -264,6 +345,18 @@ verify_install() {
 # ---------------------------------------------------------------------------
 show_status() {
     echo -e "\n${BOLD}squeezelite-bluetooth status${NC}  ($(date '+%Y-%m-%d %H:%M:%S'))\n"
+
+    # Install manifest
+    if [[ -f "$MANIFEST" ]]; then
+        local inst_date arch backend
+        inst_date="$(grep '^DATE=' "$MANIFEST" | cut -d= -f2)"
+        arch="$(grep '^ARCH=' "$MANIFEST" | cut -d= -f2)"
+        backend="$(grep '^AUDIO_BACKEND=' "$MANIFEST" | cut -d= -f2)"
+        echo -e "  ${BOLD}Installed:${NC} ${inst_date}  |  arch: ${arch}  |  audio: ${backend:-bluealsa}"
+    else
+        warn "No install manifest found — install may be incomplete"
+    fi
+    echo
 
     # Services
     echo -e "${BOLD}Services${NC}"
@@ -287,7 +380,6 @@ show_status() {
     if [[ -f "$cfg" ]]; then
         local current_mac="" count=0
         while IFS= read -r line; do
-            # Strip inline comments and surrounding whitespace
             line="${line%%#*}"
             line="${line#"${line%%[![:space:]]*}"}"
             line="${line%"${line##*[![:space:]]}"}"
@@ -422,26 +514,24 @@ do_update() {
 }
 
 # ---------------------------------------------------------------------------
-# Uninstall
+# Uninstall — delegate to uninstall.sh
 # ---------------------------------------------------------------------------
 do_uninstall() {
-    step "Stopping and disabling services"
+    local uninstaller="$SCRIPT_DIR/uninstall.sh"
+    if [[ -x "$uninstaller" ]]; then
+        exec "$uninstaller" "${@}"
+    fi
+    # Fallback if uninstall.sh is missing
+    warn "uninstall.sh not found — running basic removal"
     for svc in btspeaker-monitor bluezalsa; do
         systemctl stop    "${svc}.service" 2>/dev/null || true
         systemctl disable "${svc}.service" 2>/dev/null || true
         rm -f "$SERVICE_DIR/${svc}.service"
-        ok "Removed ${svc}.service"
     done
-
     systemctl daemon-reload
-
-    step "Removing files"
     rm -rf "$PYSERVER_DIR"
-    ok "Removed $PYSERVER_DIR"
-
     warn "The '$LMS_USER' user and bluealsa binary were NOT removed"
-    warn "To remove manually: userdel $LMS_USER  &&  apt-get remove bluealsa"
-    ok "Uninstall complete"
+    ok "Basic removal complete"
 }
 
 # ---------------------------------------------------------------------------
@@ -451,21 +541,36 @@ main() {
     check_root
     check_src
     detect_arch
+
+    # Initialise manifest (fresh on every full install)
+    WRITING_MANIFEST=true
+    mkdir -p "$MANIFEST_DIR"
+    {
+        echo "# squeezelite-bluetooth install manifest — do not edit"
+        echo "DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "ARCH=$(uname -m)"
+        echo "MANIFEST_DIR=$MANIFEST_DIR"
+    } > "$MANIFEST"
+
+    detect_audio_backend
     install_system_deps
     install_bluealsa
     deploy_files
+    write_backend_config
     create_lms_user
     set_permissions
     warn_if_old_format
     configure_bt_autopoweron
     enable_services
     verify_install
+
+    ok "Install manifest written to $MANIFEST"
 }
 
 case "${1:-}" in
     "")             main ;;
     --update)       check_root; check_src; do_update ;;
-    --uninstall)    check_root; do_uninstall ;;
+    --uninstall)    check_root; do_uninstall "${@:2}" ;;
     --add-device)   add_device_wizard ;;
     --status)       show_status ;;
     *)
@@ -475,7 +580,7 @@ case "${1:-}" in
         echo "  --update       Redeploy files and restart services (no rebuild)"
         echo "  --add-device   Pair a new Bluetooth speaker and register it"
         echo "  --status       Show service state, configured and connected devices"
-        echo "  --uninstall    Stop services and remove installed files"
+        echo "  --uninstall    Remove everything (delegates to uninstall.sh)"
         echo
         echo "  --status does not require sudo"
         exit 1

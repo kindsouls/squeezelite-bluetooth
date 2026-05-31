@@ -4,7 +4,7 @@ Connects a Bluetooth speaker to a **Raspberry Pi running squeezelite**. The spea
 
 A background service tracks the Bluetooth connection state via D-Bus and starts/stops squeezelite accordingly, solving two problems with the naive setup: squeezelite crashing on disconnection, and the speaker not auto-reconnecting.
 
-Audio transport uses **bluez-alsa** (ALSA ↔ Bluetooth bridge). PipeWire is an alternative on modern Raspberry Pi OS — see [PipeWire note](#pipewire-alternative) at the end.
+The installer auto-detects your audio system and configures accordingly: **bluez-alsa** on older Pi OS (Buster/Bullseye), **PipeWire** on Bookworm (2023+). Both are fully supported.
 
 *Guide enhanced with input from cpd73 and paul- (forum.slimdevices.com) and Eric (github.com/coissac).*
 
@@ -27,8 +27,11 @@ sudo ./install.sh --add-device
 # After changing files, push updates without a full rebuild
 sudo ./install.sh --update
 
-# Remove everything
-sudo ./install.sh --uninstall
+# Remove everything (reads install manifest for precise removal)
+sudo ./uninstall.sh
+
+# Non-interactive removal (e.g. in scripts)
+sudo ./uninstall.sh --yes
 ```
 
 The manual steps below explain what the installer does, if you prefer to do it yourself.
@@ -38,14 +41,17 @@ The manual steps below explain what the installer does, if you prefer to do it y
 ## How it works
 
 1. When a trusted Bluetooth speaker powers on, it reconnects to the Pi automatically.
-2. The `bluealsa` daemon creates an ALSA audio device for the Bluetooth connection and fires a D-Bus signal (`PCMAdded`).
-3. `btspeaker-monitor.py` receives the signal, looks up the device in `bt-devices`, and spawns a `squeezelite` process pointed at that ALSA device.
+2. The audio stack (bluealsa or PipeWire) makes the BT connection available and signals readiness via D-Bus.
+3. `btspeaker-monitor.py` receives the signal, looks up the device in `bt-devices`, and spawns a `squeezelite` process.
 4. squeezelite connects to your LMS server and the player appears — ready to play.
-5. When the speaker powers off, `bluealsa` fires `PCMRemoved`, the monitor stops squeezelite, and the player disappears from LMS.
+5. When the speaker powers off, the monitor detects the disconnection, stops squeezelite, and the player disappears from LMS.
+
+**bluealsa mode** (Buster/Bullseye): watches `PCMAdded`/`PCMRemoved` signals from `org.bluealsa.Manager1`.
+**PipeWire mode** (Bookworm): watches `Connected` property changes directly on BlueZ device objects via `org.freedesktop.DBus.Properties`.
 
 The monitor also handles failure cases automatically:
-- **Pi boots while speaker is already on:** queries bluealsa for active connections at startup.
-- **bluealsa crashes:** watches for the service restarting and re-queries connections.
+- **Pi boots while speaker is already on:** queries the audio stack for active connections at startup.
+- **Audio service crashes:** watches for it restarting and re-queries connections automatically.
 - **squeezelite crashes:** a health check sweep every 10 seconds detects the crash and restarts squeezelite automatically — no speaker power cycle needed.
 
 ---
@@ -68,7 +74,9 @@ This installs an older version. For the latest binary, download the appropriate 
 - 32-bit Pi OS (armhf): use the `arm6f` archive
 - 64-bit Pi OS (aarch64): use the `aarch64` archive
 
-### 3. Build and install bluez-alsa
+### 3. Build and install bluez-alsa *(bluez-alsa backend only)*
+
+Skip this step if your Pi runs Raspberry Pi OS Bookworm — `sudo ./install.sh` detects PipeWire and skips bluez-alsa automatically. Only needed on Buster/Bullseye or if forcing the bluealsa backend.
 
 This library bridges Bluetooth audio to the ALSA sound system.
 
@@ -145,9 +153,10 @@ sudo chmod +x /etc/pyserver/btspeaker-monitor.py
 
 ```bash
 sudo systemctl daemon-reload
+# bluezalsa only needed on bluez-alsa backend (not PipeWire):
 sudo systemctl enable bluezalsa.service
-sudo systemctl enable btspeaker-monitor.service
 sudo systemctl start bluezalsa.service
+sudo systemctl enable btspeaker-monitor.service
 sudo systemctl start btspeaker-monitor.service
 ```
 
@@ -201,7 +210,7 @@ lms = 192.168.1.10
 | Option | Required | Description |
 |---|---|---|
 | `name` | Yes | Player name in LMS. **No spaces** — use underscores or CamelCase. |
-| `codec` | No | Audio codec: `sbc` (default), `aptx`, `aac`, `sbc-xq`, `faststream`. Only applies if both devices support it. |
+| `codec` | No | Audio codec: `sbc` (default), `aptx`, `aac`, `sbc-xq`, `faststream`. bluez-alsa backend only — ignored in PipeWire mode (PipeWire negotiates codec internally). |
 | `lms` | No | LMS server IP or hostname. Omit to auto-discover on LAN via mDNS. |
 
 The file is re-read on every connect event — changes take effect on the next speaker connection without restarting the service.
@@ -236,24 +245,40 @@ sudo journalctl -fu btspeaker-monitor
 sudo journalctl -fu bluezalsa
 ```
 
-**Verify the bluealsa ALSA device appears after the speaker connects:**
-```bash
-aplay -L | grep bluealsa
-```
-
 **Check Bluetooth device state:**
 ```bash
 bluetoothctl info AA:BB:CC:DD:EE:FF
 ```
 
-**Watch D-Bus signals in real time** (useful for confirming the monitor sees events):
+**bluealsa backend — verify ALSA device appears after speaker connects:**
+```bash
+aplay -L | grep bluealsa
+```
+
+**bluealsa backend — watch D-Bus PCM signals in real time:**
 ```bash
 dbus-monitor --system "type='signal',interface='org.bluealsa.Manager1'"
 ```
 
-**Query what PCMs bluealsa currently knows about:**
+**bluealsa backend — query active PCMs:**
 ```bash
 busctl call org.bluealsa /org/bluealsa org.bluealsa.Manager1 GetPCMs
+```
+
+**PipeWire backend — watch BlueZ device property changes in real time:**
+```bash
+dbus-monitor --system "type='signal',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged'"
+```
+
+**PipeWire backend — verify WirePlumber is running:**
+```bash
+systemctl status wireplumber
+pgrep -a wireplumber
+```
+
+**Inspect what was installed** (useful after a partial install or upgrade):
+```bash
+cat /var/lib/squeezelite-bluetooth/install.manifest
 ```
 
 **Common problems:**
@@ -265,14 +290,40 @@ busctl call org.bluealsa /org/bluealsa org.bluealsa.Manager1 GetPCMs
 | `bluezalsa.service` fails to start | bluealsa binary not at `/usr/bin/bluealsa` | Re-run `sudo ./install.sh` or check `which bluealsa` |
 | `btspeaker-monitor.service` exits instantly | squeezelite or bt-devices not found | Check `/usr/bin/squeezelite` exists and `/etc/pyserver/bt-devices` is present |
 | Sound plays but is choppy | A2DP buffer underrun | Try `export LIBASOUND_THREAD_SAFE=0` before testing manually |
-| Speaker connects but no ALSA device | PipeWire conflict on Bookworm | See PipeWire note below |
+| Speaker connects but no ALSA device | PipeWire conflict on Bookworm | Re-run `sudo ./install.sh` — it now detects PipeWire and switches backends |
 | squeezelite keeps restarting in logs | ALSA or LMS error on startup | Check `journalctl -fu btspeaker-monitor`; set explicit `lms =` in bt-devices |
 | No devices watched after `--update` | bt-devices still in old `MAC=Name` format | Restart the monitor — it auto-migrates the file and backs up the original |
 
 ---
 
-## PipeWire alternative
+## PipeWire support
 
-Modern Raspberry Pi OS (Bookworm, 2023+) ships **PipeWire** by default, which handles Bluetooth audio natively without bluez-alsa. If your Pi is already running PipeWire, you can skip building bluez-alsa entirely — configure squeezelite to use `pipewire` as its output and use WirePlumber rules or a BlueZ D-Bus watcher to start/stop it.
+Modern Raspberry Pi OS (**Bookworm**, 2023+) ships PipeWire by default. On these systems, bluez-alsa cannot claim the A2DP Bluetooth profile because PipeWire already owns it. The installer detects PipeWire automatically and switches to a PipeWire-native audio path — no manual configuration needed.
 
-The approach in this repo (bluez-alsa + ALSA) works on all Pi OS versions and requires no PipeWire knowledge, making it the more broadly compatible option.
+### What the installer does
+
+```
+sudo ./install.sh          # auto-detects PipeWire or bluez-alsa
+```
+
+| Pi OS version | Detected backend | Audio path |
+|---|---|---|
+| Bookworm (2023+) | PipeWire | squeezelite `-o pipewire` |
+| Bullseye / Buster | bluez-alsa | squeezelite `-o bluealsa:...` |
+
+To override auto-detection:
+```bash
+FORCE_AUDIO_BACKEND=pipewire  sudo ./install.sh   # force PipeWire
+FORCE_AUDIO_BACKEND=bluealsa  sudo ./install.sh   # force bluez-alsa
+```
+
+### How PipeWire mode works
+
+Instead of watching bluez-alsa's `PCMAdded`/`PCMRemoved` D-Bus signals, the monitor watches BlueZ directly for `Connected` property changes on device objects. When a trusted speaker connects, squeezelite is started with `-o pipewire`; PipeWire routes the audio automatically. When the speaker disconnects, squeezelite is stopped.
+
+The `codec` option in `bt-devices` is **not used in PipeWire mode** — PipeWire handles codec negotiation internally.
+
+### Requirements for PipeWire mode
+
+- squeezelite must be compiled with PipeWire support (`-o pipewire`). The `squeezelite` package on Bookworm includes this by default. If you downloaded a binary from Sourceforge, verify it supports PipeWire with `squeezelite -o pipewire -? 2>&1 | head -5`.
+- WirePlumber (PipeWire's session manager) must be running — it handles BT audio routing.
